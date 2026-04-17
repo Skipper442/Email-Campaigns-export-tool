@@ -1,0 +1,1377 @@
+// ==UserScript==
+// @name         Email Campaign Groups export tool
+// @namespace    http://tampermonkey.net/
+// @version      2.4
+// @description  Export Loan# and Name from Pending report into Group A / Group B with Legend sheet and sending report
+// @match        https://apply.creditcube.com/plm.net/reports/LoansReport.aspx?reportpreset=pending*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @require      https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js
+// ==/UserScript==
+
+/* global XLSX */
+
+(function () {
+  'use strict';
+
+  const SheetJS = window.XLSX || (typeof XLSX !== 'undefined' ? XLSX : null);
+  if (!SheetJS) {
+    alert('SheetJS failed to load. Please reload the page and try again.');
+    return;
+  }
+
+  const CONFIG = {
+    tableSelector: 'table.DataTable.FixedHeader',
+    crmEmailTemplateSelector: '#maincontent_Letter_ForEmail',
+    loginTypeSelector: 'span.LoginType',
+    panelId: 'tm-email-campaign-panel',
+    panelCollapsedStorageKey: 'tmec-panel-collapsed-v1',
+    sendEndpoint: '/plm.net/reports/LoansReport.aspx/DoLetterAction?reportpreset=pending'
+  };
+
+  const EXPORT_MODES = {
+    AB: 'ab',
+    ALL_IN_A: 'all_in_a'
+  };
+
+  const STATE = {
+    lastRows: [],
+    lastGroupA: [],
+    lastGroupB: [],
+    collapsed: false,
+    isSending: false,
+    lastSendReport: null
+  };
+
+  function formatDate(date = new Date()) {
+    const yyyy = date.getFullYear();
+    const mm = String(date.getMonth() + 1).padStart(2, '0');
+    const dd = String(date.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function formatUsDate(isoDateString) {
+    if (!isoDateString) return '';
+
+    const parts = String(isoDateString).split('-');
+    if (parts.length !== 3) return isoDateString;
+
+    const [year, month, day] = parts.map(Number);
+    const date = new Date(year, month - 1, day);
+
+    if (Number.isNaN(date.getTime())) return isoDateString;
+
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+  }
+
+  function sanitizeFileName(name) {
+    return String(name || '')
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function escapeHtml(str) {
+    return String(str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function getCurrentUserLabel() {
+    const el = document.querySelector(CONFIG.loginTypeSelector);
+    const raw = (el?.textContent || '').trim();
+
+    if (!raw) return 'Unknown';
+
+    const beforePipe = raw.split('|')[0].trim();
+    return beforePipe || 'Unknown';
+  }
+
+  function waitForElement(selector, timeout = 20000) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector(selector);
+      if (existing) {
+        resolve(existing);
+        return;
+      }
+
+      const startedAt = Date.now();
+
+      const observer = new MutationObserver(() => {
+        const found = document.querySelector(selector);
+        if (found) {
+          observer.disconnect();
+          resolve(found);
+          return;
+        }
+
+        if (Date.now() - startedAt > timeout) {
+          observer.disconnect();
+          reject(new Error(`Element not found in time: ${selector}`));
+        }
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+
+      setTimeout(() => {
+        observer.disconnect();
+        const found = document.querySelector(selector);
+        if (found) {
+          resolve(found);
+        } else {
+          reject(new Error(`Element not found: ${selector}`));
+        }
+      }, timeout);
+    });
+  }
+
+  function extractCRMTemplateOptions() {
+    const sourceSelect = document.querySelector(CONFIG.crmEmailTemplateSelector);
+    if (!sourceSelect) return [];
+
+    return [...sourceSelect.options]
+      .map(option => ({
+        value: option.value,
+        text: (option.textContent || '').trim()
+      }))
+      .filter(option => option.text);
+  }
+
+  function getPanel() {
+    return document.getElementById(CONFIG.panelId);
+  }
+
+  function getPanelFieldValue(selector) {
+    const panel = getPanel();
+    const input = panel?.querySelector(selector);
+    return (input?.value || '').trim();
+  }
+
+  function getSelectedTemplateText() {
+    const panel = getPanel();
+    if (!panel) return 'Unnamed Email';
+
+    const select = panel.querySelector('#tmec-template-select');
+    if (!select) return 'Unnamed Email';
+
+    const selectedOption = select.options[select.selectedIndex];
+    const text = (selectedOption?.textContent || '').trim();
+
+    return text || 'Unnamed Email';
+  }
+
+  function getSelectedTemplateValue() {
+    const panel = getPanel();
+    const select = panel?.querySelector('#tmec-template-select');
+    return String(select?.value || '').trim();
+  }
+
+  function getExportMode() {
+    const panel = getPanel();
+    const checked = panel?.querySelector('input[name="tmec-export-mode"]:checked');
+    return checked?.value || EXPORT_MODES.AB;
+  }
+
+  function getCampaignMeta() {
+    return {
+      campaignName: getPanelFieldValue('#tmec-campaign-name'),
+      campaignStartDate: getPanelFieldValue('#tmec-campaign-start'),
+      campaignEndDate: getPanelFieldValue('#tmec-campaign-end')
+    };
+  }
+
+  function markFieldWarning(selector, hasWarning) {
+    const panel = getPanel();
+    const field = panel?.querySelector(selector);
+    if (!field) return;
+
+    if (hasWarning) {
+      field.classList.add('tmec-field-warning');
+    } else {
+      field.classList.remove('tmec-field-warning');
+    }
+  }
+
+  function validateOptionalFieldsBeforeExport() {
+    const { campaignName } = getCampaignMeta();
+    const hasCampaignName = Boolean(campaignName);
+
+    markFieldWarning('#tmec-campaign-name', !hasCampaignName);
+
+    if (!hasCampaignName) {
+      return window.confirm('Campaign name is empty. Do you want to continue anyway?');
+    }
+
+    return true;
+  }
+
+  function extractTableRows() {
+    const table = document.querySelector(CONFIG.tableSelector);
+    if (!table) throw new Error('Target table not found.');
+
+    const bodyRows = table.querySelectorAll('tbody > tr');
+    const result = [];
+
+    for (const tr of bodyRows) {
+      const tds = tr.querySelectorAll('td');
+      if (!tds || tds.length < 5) continue;
+
+      const loanId = (tds[1]?.textContent || '').trim();
+      const nameCell = tds[4];
+      const nameLink = nameCell ? nameCell.querySelector('a') : null;
+      const name = (nameLink?.textContent || nameCell?.textContent || '').trim();
+
+      if (!loanId || !name) continue;
+
+      result.push({
+        'Loan#': loanId,
+        Name: name
+      });
+    }
+
+    return result;
+  }
+
+  function splitIntoGroups(rows, mode) {
+    if (mode === EXPORT_MODES.ALL_IN_A) {
+      return {
+        groupA: rows.slice(),
+        groupB: []
+      };
+    }
+
+    const half = Math.floor(rows.length / 2);
+
+    return {
+      groupA: rows.slice(0, half),
+      groupB: rows.slice(half)
+    };
+  }
+
+  function ensureGroupsFromCurrentMode() {
+    const rows = extractTableRows();
+    const exportMode = getExportMode();
+    const split = splitIntoGroups(rows, exportMode);
+
+    STATE.lastRows = rows;
+    STATE.lastGroupA = split.groupA;
+    STATE.lastGroupB = split.groupB;
+
+    return {
+      rows,
+      groupA: split.groupA,
+      groupB: split.groupB,
+      exportMode
+    };
+  }
+
+  function setColumnWidths(ws, widthsPx) {
+    ws['!cols'] = widthsPx.map(wpx => ({ wpx }));
+  }
+
+  function buildLegendSheet(params) {
+    const {
+      generatedBy,
+      plannedEmail,
+      emailId,
+      totalClients,
+      groupACount,
+      groupBCount,
+      exportMode,
+      campaignName,
+      campaignStartDate,
+      campaignEndDate,
+      totalSend,
+      totalErrors
+    } = params;
+
+    const legendRows = [
+      ['Field', 'Value'],
+      ['Generated by', generatedBy],
+      ['Planned email', plannedEmail],
+      ['Email ID', emailId || ''],
+      ['Campaign name', campaignName || ''],
+      ['Campaign start date', formatUsDate(campaignStartDate)],
+      ['Campaign end date', formatUsDate(campaignEndDate)],
+      ['Total clients', totalClients]
+    ];
+
+    if (exportMode === EXPORT_MODES.AB) {
+      legendRows.push(['Clients in Group A', groupACount]);
+      legendRows.push(['Clients in Group B', groupBCount]);
+      legendRows.push(['Total send', totalSend ?? '']);
+      legendRows.push(['Total errors', totalErrors ?? '']);
+      legendRows.push(['Group A description', 'Control group']);
+      legendRows.push(['Group B description', 'Sending promo emails to this group']);
+      legendRows.push(['Distribution rule', 'Email goes to Group B']);
+    } else {
+      legendRows.push(['Clients in Group A', groupACount]);
+      legendRows.push(['Total send', totalSend ?? '']);
+      legendRows.push(['Total errors', totalErrors ?? '']);
+      legendRows.push(['Group A description', 'All customers in one group']);
+      legendRows.push(['Group B description', '']);
+      legendRows.push(['Distribution rule', 'No A/B split']);
+    }
+
+    legendRows.push(['Additional comments', '']);
+
+    const ws = SheetJS.utils.aoa_to_sheet(legendRows);
+    setColumnWidths(ws, [220, 520]);
+    return ws;
+  }
+
+  function buildGroupSheet(rows, includeSendColumns = false) {
+    const header = includeSendColumns
+      ? ['Loan#', 'Name', 'Send status', 'Send error']
+      : ['Loan#', 'Name'];
+
+    const aoa = [
+      header,
+      ...rows.map(row => includeSendColumns
+        ? [row['Loan#'], row.Name, row.sendStatus || '', row.sendError || '']
+        : [row['Loan#'], row.Name]
+      )
+    ];
+
+    const ws = SheetJS.utils.aoa_to_sheet(aoa);
+    setColumnWidths(ws, includeSendColumns ? [120, 240, 110, 320] : [120, 240]);
+    return ws;
+  }
+
+  function createWorkbook(rows, plannedEmail, exportMode, campaignMeta) {
+    const { groupA, groupB } = splitIntoGroups(rows, exportMode);
+
+    STATE.lastRows = rows;
+    STATE.lastGroupA = groupA;
+    STATE.lastGroupB = groupB;
+
+    const wsLegend = buildLegendSheet({
+      generatedBy: getCurrentUserLabel(),
+      plannedEmail,
+      emailId: getSelectedTemplateValue(),
+      totalClients: rows.length,
+      groupACount: groupA.length,
+      groupBCount: groupB.length,
+      exportMode,
+      campaignName: campaignMeta.campaignName,
+      campaignStartDate: campaignMeta.campaignStartDate,
+      campaignEndDate: campaignMeta.campaignEndDate,
+      totalSend: '',
+      totalErrors: ''
+    });
+
+    const wsA = buildGroupSheet(groupA);
+
+    const wb = SheetJS.utils.book_new();
+    SheetJS.utils.book_append_sheet(wb, wsLegend, 'Legend');
+    SheetJS.utils.book_append_sheet(wb, wsA, 'Group A');
+
+    if (exportMode === EXPORT_MODES.AB) {
+      const wsB = buildGroupSheet(groupB);
+      SheetJS.utils.book_append_sheet(wb, wsB, 'Group B');
+    }
+
+    return wb;
+  }
+
+  function setStatus(message, type = 'info') {
+    const panel = getPanel();
+    if (!panel) return;
+
+    const status = panel.querySelector('#tmec-status');
+    if (!status) return;
+
+    status.textContent = message;
+    status.setAttribute('data-status-type', type);
+  }
+
+  function buildFileName(templateText, exportMode, campaignMeta) {
+    const modeLabel = exportMode === EXPORT_MODES.ALL_IN_A ? 'All-customers' : 'A-B';
+    const campaignPart = campaignMeta.campaignName ? ` ${campaignMeta.campaignName}` : '';
+    return sanitizeFileName(`Email Campaign: ${templateText}${campaignPart} ${modeLabel} ${formatDate()}.xlsx`);
+  }
+
+  function asyncCopyFallback(text) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+  }
+
+  async function copyTextToClipboard(text) {
+    if (window.isSecureContext && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+
+    asyncCopyFallback(text);
+  }
+
+  function downloadWorkbook() {
+    try {
+      if (!validateOptionalFieldsBeforeExport()) {
+        setStatus('Export canceled by user.', 'info');
+        return;
+      }
+
+      setStatus('Reading table...', 'info');
+
+      const rows = extractTableRows();
+      if (!rows.length) {
+        setStatus('No valid Loan# / Name rows found in the target table.', 'error');
+        alert('No valid Loan# / Name rows found in the target table.');
+        return;
+      }
+
+      const templateText = sanitizeFileName(getSelectedTemplateText());
+      const exportMode = getExportMode();
+      const campaignMeta = getCampaignMeta();
+      const workbook = createWorkbook(rows, templateText, exportMode, campaignMeta);
+      const filename = buildFileName(templateText, exportMode, campaignMeta);
+
+      setStatus(`Preparing Excel file for ${rows.length} rows...`, 'info');
+      SheetJS.writeFile(workbook, filename);
+      setStatus(`Done. Exported ${rows.length} rows.`, 'success');
+    } catch (error) {
+      console.error('[TM Export] Export failed:', error);
+      setStatus(`Export failed: ${error.message}`, 'error');
+      alert(`Export failed: ${error.message}`);
+    }
+  }
+
+  function parseSendErrors(errorMessage) {
+    const normalized = String(errorMessage || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .trim();
+
+    const regex = /(?:^|\n)-?Sending email to customer\s+(.+?)\s+failed:\s*(.+?)(?=\n-?Sending email to customer|\s*$)/gi;
+    const parsed = [];
+
+    for (const match of normalized.matchAll(regex)) {
+      parsed.push({
+        customerName: String(match[1] || '').trim(),
+        reason: String(match[2] || '').trim()
+      });
+    }
+
+    return parsed;
+  }
+
+  function extractServerMessages(rawResponse) {
+    let parsedJson = null;
+
+    if (typeof rawResponse?.d?.json === 'string' && rawResponse.d.json.trim()) {
+      try {
+        parsedJson = JSON.parse(rawResponse.d.json);
+      } catch (error) {
+        console.warn('[TM Export] Failed to parse rawResponse.d.json:', error);
+      }
+    }
+
+    const successMessage =
+      String(
+        parsedJson?.Message ??
+        rawResponse?.d?.Message ??
+        rawResponse?.Message ??
+        ''
+      ).trim();
+
+    const errorMessage =
+      String(
+        parsedJson?.errormessage ??
+        rawResponse?.d?.errormessage ??
+        rawResponse?.errormessage ??
+        ''
+      ).trim();
+
+    return {
+      successMessage,
+      errorMessage,
+      parsedJson
+    };
+  }
+
+  function buildSendReport(targetRows, serverMessages, exportMode) {
+    const successMessage = String(serverMessages?.successMessage || '').trim();
+    const errorMessage = String(serverMessages?.errorMessage || '').trim();
+    const parsedErrors = parseSendErrors(errorMessage);
+
+    const enrichedRows = targetRows.map(row => ({
+      ...row,
+      sendStatus: 'Sent',
+      sendError: ''
+    }));
+
+    for (const err of parsedErrors) {
+      const matchedRows = enrichedRows.filter(row => String(row.Name || '').trim() === err.customerName);
+      for (const row of matchedRows) {
+        row.sendStatus = 'Error';
+        row.sendError = err.reason;
+      }
+    }
+
+    const totalErrors = enrichedRows.filter(row => row.sendStatus === 'Error').length;
+    const totalSent = enrichedRows.length - totalErrors;
+
+    return {
+      mode: exportMode,
+      templateId: getSelectedTemplateValue(),
+      templateText: getSelectedTemplateText(),
+      targetSheet: exportMode === EXPORT_MODES.ALL_IN_A ? 'Group A' : 'Group B',
+      totalTargeted: enrichedRows.length,
+      totalSent,
+      totalErrors,
+      successMessage,
+      errorMessage,
+      parsedErrors,
+      rows: enrichedRows
+    };
+  }
+
+  function buildPreviewHtml(title, rows, templateText, copyButtonLabel) {
+    const rowsHtml = rows.map((row, index) => `
+      <tr>
+        <td>${index + 1}</td>
+        <td>${escapeHtml(row['Loan#'])}</td>
+        <td>${escapeHtml(row.Name)}</td>
+      </tr>
+    `).join('');
+
+    const loanIdsText = rows.map(row => row['Loan#']).join('\n');
+
+    return `
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 16px;
+    color: #1f2328;
+    background: #ffffff;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 10px;
+  }
+  .meta {
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    line-height: 1.5;
+  }
+  .actions {
+    margin-bottom: 14px;
+  }
+  .copy-btn {
+    border: none;
+    border-radius: 8px;
+    background: #344054;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 10px 14px;
+    cursor: pointer;
+  }
+  .copy-btn:hover {
+    background: #1f2937;
+  }
+  .copy-status {
+    margin-left: 10px;
+    font-size: 13px;
+    color: #116329;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+    word-break: break-word;
+  }
+  th {
+    background: #f3f4f6;
+  }
+</style>
+</head>
+<body>
+  <h1>${escapeHtml(title)}</h1>
+
+  <div class="meta">
+    <div><strong>Selected template:</strong> ${escapeHtml(templateText)}</div>
+    <div><strong>Total clients:</strong> ${rows.length}</div>
+  </div>
+
+  <div class="actions">
+    <button id="copy-loans-btn" class="copy-btn" type="button">${escapeHtml(copyButtonLabel)}</button>
+    <span id="copy-status" class="copy-status"></span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="width: 60px;">#</th>
+        <th style="width: 160px;">Loan#</th>
+        <th>Name</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rowsHtml}
+    </tbody>
+  </table>
+
+  <script>
+    const loanIdsText = ${JSON.stringify(loanIdsText)};
+    const button = document.getElementById('copy-loans-btn');
+    const status = document.getElementById('copy-status');
+
+    async function copyText(text) {
+      if (window.isSecureContext && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-9999px';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    }
+
+    button.addEventListener('click', async () => {
+      try {
+        await copyText(loanIdsText);
+        status.textContent = 'Loan# copied';
+      } catch (error) {
+        status.textContent = 'Copy failed';
+      }
+    });
+  </script>
+</body>
+</html>
+    `;
+  }
+
+  function openPreviewWindow(title, rows, copyButtonLabel) {
+    if (!rows.length) {
+      alert(`${title} is empty.`);
+      return;
+    }
+
+    const previewWindow = window.open('', '_blank', 'width=900,height=700,scrollbars=yes,resizable=yes');
+    if (!previewWindow) {
+      alert('Preview window was blocked by the browser.');
+      return;
+    }
+
+    const html = buildPreviewHtml(title, rows, getSelectedTemplateText(), copyButtonLabel);
+    previewWindow.document.open();
+    previewWindow.document.write(html);
+    previewWindow.document.close();
+  }
+
+  function previewGroupA() {
+    try {
+      const { groupA, exportMode } = ensureGroupsFromCurrentMode();
+
+      if (exportMode !== EXPORT_MODES.AB) {
+        alert('Preview Group A is available only in A/B test mode.');
+        return;
+      }
+
+      openPreviewWindow('Preview Group A', groupA, 'Copy Group A Loan#');
+      setStatus(`Opened preview for ${groupA.length} Group A clients.`, 'success');
+    } catch (error) {
+      console.error('[TM Export] Preview Group A failed:', error);
+      setStatus(`Preview failed: ${error.message}`, 'error');
+      alert(`Preview failed: ${error.message}`);
+    }
+  }
+
+  function previewGroupB() {
+    try {
+      const { groupB, exportMode } = ensureGroupsFromCurrentMode();
+
+      if (exportMode !== EXPORT_MODES.AB) {
+        alert('Preview Group B is available only in A/B test mode.');
+        return;
+      }
+
+      openPreviewWindow('Preview Group B', groupB, 'Copy Group B Loan#');
+      setStatus(`Opened preview for ${groupB.length} Group B clients.`, 'success');
+    } catch (error) {
+      console.error('[TM Export] Preview Group B failed:', error);
+      setStatus(`Preview failed: ${error.message}`, 'error');
+      alert(`Preview failed: ${error.message}`);
+    }
+  }
+
+  function previewAllCustomers() {
+    try {
+      const { rows } = ensureGroupsFromCurrentMode();
+      openPreviewWindow('Preview all customers', rows, 'Copy all customers Loan#');
+      setStatus(`Opened preview for ${rows.length} customers.`, 'success');
+    } catch (error) {
+      console.error('[TM Export] Preview all customers failed:', error);
+      setStatus(`Preview failed: ${error.message}`, 'error');
+      alert(`Preview failed: ${error.message}`);
+    }
+  }
+
+  function showSendReportDownloadButton(show) {
+    const panel = getPanel();
+    const btn = panel?.querySelector('#tmec-download-send-report-btn');
+    if (!btn) return;
+    btn.style.display = show ? '' : 'none';
+  }
+
+  async function sendToCurrentTarget() {
+    try {
+      if (STATE.isSending) return;
+
+      const { rows, groupB, exportMode } = ensureGroupsFromCurrentMode();
+      const isAllCustomers = exportMode === EXPORT_MODES.ALL_IN_A;
+      const targetRows = isAllCustomers ? rows : groupB;
+      const targetLabel = isAllCustomers ? 'all customers' : 'Group B';
+
+      if (!targetRows.length) {
+        alert(`${targetLabel} is empty.`);
+        return;
+      }
+
+      const templateId = getSelectedTemplateValue();
+      const templateText = getSelectedTemplateText();
+
+      if (!templateId) {
+        alert('Please select an email template first.');
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `Send "${templateText}" to ${targetRows.length} ${targetLabel} clients?`
+      );
+
+      if (!confirmed) {
+        setStatus(`Send to ${targetLabel} canceled by user.`, 'info');
+        return;
+      }
+
+      STATE.isSending = true;
+      refreshActionLayout();
+
+      const loanIds = targetRows
+        .map(row => String(row['Loan#'] || '').trim())
+        .filter(Boolean)
+        .join(',');
+
+      setStatus(`Sending email to ${targetRows.length} ${targetLabel} clients...`, 'info');
+
+      const response = await fetch(CONFIG.sendEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=UTF-8'
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          letterloanids: loanIds,
+          letteraction: 'send',
+          letterid: templateId,
+          customtextmessengeraccountid: '',
+          customtextmessage: ''
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const raw = await response.json();
+      const serverMessages = extractServerMessages(raw);
+      const report = buildSendReport(targetRows, serverMessages, exportMode);
+      STATE.lastSendReport = report;
+
+      console.log('[TM Export] raw server response:', raw);
+      console.log('[TM Export] extracted server messages:', serverMessages);
+      console.log('[TM Export] parsed send errors:', report.parsedErrors);
+      console.log('[TM Export] last send report:', report);
+
+      const hasErrors = report.totalErrors > 0;
+      const popupMessage = hasErrors
+        ? `Sending completed with errors.\n\nTotal sent: ${report.totalSent}\nTotal errors: ${report.totalErrors}\n\nYou can now download a file with the sending report.`
+        : `Letter(s) sent.\n\nYou can now download a file with the sending report.`;
+
+      setStatus(
+        hasErrors
+          ? `Completed with errors. Sent: ${report.totalSent}, errors: ${report.totalErrors}.`
+          : `Success. Sent: ${report.totalSent}.`,
+        hasErrors ? 'error' : 'success'
+      );
+
+      showSendReportDownloadButton(true);
+      alert(popupMessage);
+    } catch (error) {
+      console.error('[TM Export] Send failed:', error);
+      setStatus(`Send failed: ${error.message}`, 'error');
+      alert(`Send failed: ${error.message}`);
+    } finally {
+      STATE.isSending = false;
+      refreshActionLayout();
+    }
+  }
+
+  function downloadWorkbookWithSendReport() {
+    try {
+      if (!STATE.lastSendReport) {
+        alert('No sending report is available yet.');
+        return;
+      }
+
+      const rows = extractTableRows();
+      const exportMode = STATE.lastSendReport.mode;
+      const campaignMeta = getCampaignMeta();
+      const templateText = sanitizeFileName(STATE.lastSendReport.templateText);
+
+      const split = splitIntoGroups(rows, exportMode);
+      const reportRows = STATE.lastSendReport.rows;
+      const wb = SheetJS.utils.book_new();
+
+      const wsLegend = buildLegendSheet({
+        generatedBy: getCurrentUserLabel(),
+        plannedEmail: STATE.lastSendReport.templateText,
+        emailId: STATE.lastSendReport.templateId,
+        totalClients: rows.length,
+        groupACount: split.groupA.length,
+        groupBCount: split.groupB.length,
+        exportMode,
+        campaignName: campaignMeta.campaignName,
+        campaignStartDate: campaignMeta.campaignStartDate,
+        campaignEndDate: campaignMeta.campaignEndDate,
+        totalSend: STATE.lastSendReport.totalSent,
+        totalErrors: STATE.lastSendReport.totalErrors
+      });
+
+      SheetJS.utils.book_append_sheet(wb, wsLegend, 'Legend');
+
+      if (exportMode === EXPORT_MODES.ALL_IN_A) {
+        SheetJS.utils.book_append_sheet(wb, buildGroupSheet(reportRows, true), 'Group A');
+      } else {
+        SheetJS.utils.book_append_sheet(wb, buildGroupSheet(split.groupA, false), 'Group A');
+        SheetJS.utils.book_append_sheet(wb, buildGroupSheet(reportRows, true), 'Group B');
+      }
+
+      const filename = sanitizeFileName(
+        `Email Campaign Sending Report ${templateText} ${formatDate()}.xlsx`
+      );
+
+      SheetJS.writeFile(wb, filename);
+      setStatus('Sending report file downloaded.', 'success');
+    } catch (error) {
+      console.error('[TM Export] Sending report export failed:', error);
+      setStatus(`Sending report export failed: ${error.message}`, 'error');
+      alert(`Sending report export failed: ${error.message}`);
+    }
+  }
+
+  function applyCollapsedState() {
+    const panel = getPanel();
+    if (!panel) return;
+
+    const body = panel.querySelector('.tmec-body');
+    const toggle = panel.querySelector('#tmec-collapse-btn');
+
+    if (!body || !toggle) return;
+
+    if (STATE.collapsed) {
+      body.style.display = 'none';
+      toggle.textContent = 'Expand';
+      toggle.setAttribute('title', 'Expand panel');
+    } else {
+      body.style.display = '';
+      toggle.textContent = 'Collapse';
+      toggle.setAttribute('title', 'Collapse panel');
+    }
+  }
+
+  function persistCollapsedState() {
+    try {
+      GM_setValue(CONFIG.panelCollapsedStorageKey, STATE.collapsed);
+    } catch (error) {
+      console.warn('[TM Export] Failed to persist panel state:', error);
+    }
+  }
+
+  function restoreCollapsedState() {
+    try {
+      STATE.collapsed = Boolean(GM_getValue(CONFIG.panelCollapsedStorageKey, false));
+    } catch (error) {
+      console.warn('[TM Export] Failed to restore panel state:', error);
+      STATE.collapsed = false;
+    }
+  }
+
+  function togglePanel() {
+    STATE.collapsed = !STATE.collapsed;
+    applyCollapsedState();
+    persistCollapsedState();
+  }
+
+  function refreshActionLayout() {
+    const panel = getPanel();
+    if (!panel) return;
+
+    const exportMode = getExportMode();
+    const isAllCustomers = exportMode === EXPORT_MODES.ALL_IN_A;
+
+    const previewGroupAButton = panel.querySelector('#tmec-preview-a-btn');
+    const previewGroupBButton = panel.querySelector('#tmec-preview-b-btn');
+    const previewAllButton = panel.querySelector('#tmec-preview-all-btn');
+    const sendButton = panel.querySelector('#tmec-send-main-btn');
+
+    if (!previewGroupAButton || !previewGroupBButton || !previewAllButton || !sendButton) {
+      return;
+    }
+
+    previewGroupAButton.style.display = isAllCustomers ? 'none' : '';
+    previewGroupBButton.style.display = isAllCustomers ? 'none' : '';
+    previewAllButton.style.display = isAllCustomers ? '' : 'none';
+
+    sendButton.textContent = isAllCustomers ? 'Send to all customers' : 'Send to Group B';
+    sendButton.title = isAllCustomers
+      ? 'Sends the selected email template to all customers in the current report.'
+      : 'Sends the selected email template to every second client in the report, which becomes Group B.';
+
+    previewGroupAButton.disabled = STATE.isSending;
+    previewGroupBButton.disabled = STATE.isSending;
+    previewAllButton.disabled = STATE.isSending;
+    sendButton.disabled = STATE.isSending;
+  }
+
+  function createPanel() {
+    if (getPanel()) return;
+
+    const templateOptions = extractCRMTemplateOptions();
+
+    const panel = document.createElement('div');
+    panel.id = CONFIG.panelId;
+
+    panel.innerHTML = `
+      <div class="tmec-topbar">
+        <div class="tmec-header">Email Campaign Export</div>
+        <button
+          id="tmec-collapse-btn"
+          class="tmec-collapse-btn"
+          type="button"
+          title="Collapse panel"
+        >
+          Collapse
+        </button>
+      </div>
+
+      <div class="tmec-body">
+        <div class="tmec-section">
+          <div class="tmec-label">Export mode</div>
+
+          <label class="tmec-radio">
+            <input type="radio" name="tmec-export-mode" value="ab" checked>
+            <span>A/B test</span>
+          </label>
+
+          <label class="tmec-radio">
+            <input type="radio" name="tmec-export-mode" value="all_in_a">
+            <span>All customers</span>
+          </label>
+        </div>
+
+        <label class="tmec-label" for="tmec-template-select">Email template</label>
+        <select id="tmec-template-select" class="tmec-select">
+          ${templateOptions.map(option => `
+            <option value="${escapeHtml(option.value)}">${escapeHtml(option.text)}</option>
+          `).join('')}
+        </select>
+
+        <label class="tmec-label" for="tmec-campaign-name">Campaign name</label>
+        <input
+          id="tmec-campaign-name"
+          class="tmec-input"
+          type="text"
+          placeholder="Optional campaign name"
+        >
+
+        <div class="tmec-date-grid">
+          <div>
+            <label class="tmec-label" for="tmec-campaign-start">Start date</label>
+            <input id="tmec-campaign-start" class="tmec-input" type="date">
+          </div>
+
+          <div>
+            <label class="tmec-label" for="tmec-campaign-end">End date</label>
+            <input id="tmec-campaign-end" class="tmec-input" type="date">
+          </div>
+        </div>
+
+        <button
+          id="tmec-download-btn"
+          class="tmec-btn"
+          type="button"
+          title="Downloads an XLSX file based on the selected export mode."
+        >
+          Download file
+        </button>
+
+        <div class="tmec-preview-grid">
+          <button
+            id="tmec-preview-a-btn"
+            class="tmec-btn tmec-btn--secondary"
+            type="button"
+            title="Opens a preview of all Loan# and Name values from Group A."
+          >
+            Preview Group A
+          </button>
+
+          <button
+            id="tmec-preview-b-btn"
+            class="tmec-btn tmec-btn--secondary"
+            type="button"
+            title="Opens a preview of all Loan# and Name values from Group B."
+          >
+            Preview Group B
+          </button>
+
+          <button
+            id="tmec-preview-all-btn"
+            class="tmec-btn tmec-btn--secondary tmec-btn--full"
+            type="button"
+            title="Opens a preview of all customers with Loan# and Name."
+            style="display:none;"
+          >
+            Preview all customers
+          </button>
+        </div>
+
+        <div id="tmec-send-section">
+          <button
+            id="tmec-send-main-btn"
+            class="tmec-btn tmec-btn--danger tmec-btn--full"
+            type="button"
+            title="Sends the selected email template to every second client in the report, which becomes Group B."
+          >
+            Send to Group B
+          </button>
+
+          <button
+            id="tmec-download-send-report-btn"
+            class="tmec-btn tmec-btn--secondary tmec-btn--full"
+            type="button"
+            style="display:none; margin-top:8px;"
+            title="Downloads an XLSX file with sending results."
+          >
+            Download file with sending report
+          </button>
+        </div>
+
+        <div id="tmec-status" class="tmec-status" data-status-type="info">
+          Ready to export.
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    const downloadButton = panel.querySelector('#tmec-download-btn');
+    const collapseButton = panel.querySelector('#tmec-collapse-btn');
+    const previewAButton = panel.querySelector('#tmec-preview-a-btn');
+    const previewBButton = panel.querySelector('#tmec-preview-b-btn');
+    const previewAllButton = panel.querySelector('#tmec-preview-all-btn');
+    const sendMainButton = panel.querySelector('#tmec-send-main-btn');
+    const downloadSendReportButton = panel.querySelector('#tmec-download-send-report-btn');
+    const exportModeInputs = panel.querySelectorAll('input[name="tmec-export-mode"]');
+
+    downloadButton.addEventListener('click', downloadWorkbook);
+    collapseButton.addEventListener('click', togglePanel);
+    previewAButton.addEventListener('click', previewGroupA);
+    previewBButton.addEventListener('click', previewGroupB);
+    previewAllButton.addEventListener('click', previewAllCustomers);
+    sendMainButton.addEventListener('click', sendToCurrentTarget);
+    downloadSendReportButton.addEventListener('click', downloadWorkbookWithSendReport);
+
+    exportModeInputs.forEach(input => {
+      input.addEventListener('change', refreshActionLayout);
+    });
+
+    const campaignNameInput = panel.querySelector('#tmec-campaign-name');
+    campaignNameInput.addEventListener('input', () => {
+      markFieldWarning('#tmec-campaign-name', false);
+    });
+
+    refreshActionLayout();
+    applyCollapsedState();
+  }
+
+  function refreshTemplateOptions() {
+    const panel = getPanel();
+    if (!panel) return;
+
+    const select = panel.querySelector('#tmec-template-select');
+    if (!select) return;
+
+    const currentValue = select.value;
+    const options = extractCRMTemplateOptions();
+
+    select.innerHTML = options.map(option => `
+      <option value="${escapeHtml(option.value)}">${escapeHtml(option.text)}</option>
+    `).join('');
+
+    if ([...select.options].some(option => option.value === currentValue)) {
+      select.value = currentValue;
+    }
+  }
+
+  function observeCRMTemplateSelect() {
+    const sourceSelect = document.querySelector(CONFIG.crmEmailTemplateSelector);
+    if (!sourceSelect) return;
+
+    const observer = new MutationObserver(() => {
+      refreshTemplateOptions();
+    });
+
+    observer.observe(sourceSelect, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+  }
+
+  function injectStyles() {
+    GM_addStyle(`
+      #${CONFIG.panelId} {
+        position: fixed;
+        top: 45px;
+        right: 12px;
+        z-index: 999999;
+        width: 340px;
+        max-height: calc(100vh - 84px);
+        overflow-y: auto;
+        background: #ffffff;
+        border: 1px solid #d0d7de;
+        border-radius: 12px;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+        padding: 12px;
+        font-family: Arial, sans-serif;
+        color: #1f2328;
+      }
+
+      #${CONFIG.panelId} .tmec-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      #${CONFIG.panelId} .tmec-header {
+        font-size: 14px;
+        font-weight: 700;
+        margin-bottom: 0;
+      }
+
+      #${CONFIG.panelId} .tmec-collapse-btn {
+        border: 1px solid #1d4ed8;
+        background: #2563eb;
+        color: #ffffff;
+        border-radius: 8px;
+        padding: 6px 9px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      #${CONFIG.panelId} .tmec-collapse-btn:hover {
+        background: #1d4ed8;
+      }
+
+      #${CONFIG.panelId} .tmec-body {
+        margin-top: 10px;
+      }
+
+      #${CONFIG.panelId} .tmec-section {
+        margin-bottom: 10px;
+        padding: 8px 10px;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        background: #f9fafb;
+      }
+
+      #${CONFIG.panelId} .tmec-label {
+        display: block;
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 5px;
+      }
+
+      #${CONFIG.panelId} .tmec-radio {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        margin-bottom: 6px;
+        cursor: pointer;
+      }
+
+      #${CONFIG.panelId} .tmec-radio:last-child {
+        margin-bottom: 0;
+      }
+
+      #${CONFIG.panelId} .tmec-select,
+      #${CONFIG.panelId} .tmec-input {
+        width: 100%;
+        margin-bottom: 10px;
+        padding: 8px 10px;
+        border: 1px solid #bfc7d1;
+        border-radius: 8px;
+        font-size: 13px;
+        background: #fff;
+        color: #1f2328;
+        box-sizing: border-box;
+      }
+
+      #${CONFIG.panelId} .tmec-input.tmec-field-warning {
+        border-color: #f59e0b;
+        box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+        background: #fffaf0;
+      }
+
+      #${CONFIG.panelId} .tmec-date-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      #${CONFIG.panelId} .tmec-preview-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      #${CONFIG.panelId} #tmec-send-section {
+        margin-top: 8px;
+      }
+
+      #${CONFIG.panelId} .tmec-btn {
+        width: 100%;
+        padding: 10px 12px;
+        border: none;
+        border-radius: 8px;
+        background: #0b6efd;
+        color: #fff;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      #${CONFIG.panelId} .tmec-btn:hover {
+        background: #0958c9;
+      }
+
+      #${CONFIG.panelId} .tmec-btn--secondary {
+        background: #344054;
+      }
+
+      #${CONFIG.panelId} .tmec-btn--secondary:hover {
+        background: #1f2937;
+      }
+
+      #${CONFIG.panelId} .tmec-btn--danger {
+        background: #b42318;
+      }
+
+      #${CONFIG.panelId} .tmec-btn--danger:hover {
+        background: #912018;
+      }
+
+      #${CONFIG.panelId} .tmec-btn--full {
+        grid-column: 1 / -1;
+      }
+
+      #${CONFIG.panelId} .tmec-btn:disabled {
+        background: #98a2b3;
+        cursor: not-allowed;
+      }
+
+      #${CONFIG.panelId} .tmec-status {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.4;
+        background: #f6f8fa;
+        color: #57606a;
+      }
+
+      #${CONFIG.panelId} .tmec-status[data-status-type="success"] {
+        background: #eafbf1;
+        color: #116329;
+      }
+
+      #${CONFIG.panelId} .tmec-status[data-status-type="error"] {
+        background: #fff1f0;
+        color: #b42318;
+      }
+    `);
+  }
+
+  async function init() {
+    try {
+      restoreCollapsedState();
+      injectStyles();
+      setTimeout(createPanel, 50);
+
+      await waitForElement(CONFIG.tableSelector, 20000);
+      await waitForElement(CONFIG.crmEmailTemplateSelector, 20000);
+
+      refreshTemplateOptions();
+      observeCRMTemplateSelect();
+      refreshActionLayout();
+      setStatus('Table and CRM templates found. Ready to export.', 'success');
+    } catch (error) {
+      console.error('[TM Export] Init failed:', error);
+      createPanel();
+      refreshActionLayout();
+      setStatus('Some source elements were not found yet. Reload page when report is fully visible.', 'error');
+    }
+  }
+
+  init();
+})();
